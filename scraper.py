@@ -7,19 +7,20 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from dotenv import load_dotenv
+import argparse
 
-# Load environment variables
+# load environment variables
 load_dotenv()
 
 class FITScraper:
-    def __init__(self):
+    def __init__(self, test_mode=False):
         self.session = requests.Session()
         self.base_url = "https://www.fit.ba/student"
         self.login_url = f"{self.base_url}/default.aspx"
         self.notifications_file = "seen_notifications.json"
-        self.seen_notifications = self.load_seen_notifications()
+        self.seen_notifications = [] if test_mode else self.load_seen_notifications()
+        self.test_mode = test_mode
         
-        # Email configuration
         self.smtp_server = "smtp.gmail.com"
         self.smtp_port = 587
         self.sender_email = os.getenv("SENDER_EMAIL")
@@ -37,14 +38,69 @@ class FITScraper:
             json.dump(self.seen_notifications, f)
 
     def login(self):
-        login_data = {
-            'txtBrojDosijea': os.getenv("STUDENT_ID"),
-            'txtLozinka': os.getenv("PASSWORD"),
-            'btnPrijava': 'Prijava'
-        }
-        
-        response = self.session.post(self.login_url, data=login_data)
-        return "Obavijesti" in response.text  # Check if login was successful
+        try:
+            print("Getting login page...")
+            response = self.session.get(self.login_url)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            form = soup.find('form')
+            if not form:
+                print("Could not find login form!")
+                return False
+            
+            form_action = form.get('action', self.login_url)
+            if not form_action.startswith('http'):
+                form_action = f"{self.base_url}/{form_action.lstrip('/')}"
+            
+            hidden_inputs = form.find_all('input', type='hidden')
+            login_data = {input.get('name'): input.get('value') for input in hidden_inputs}
+            
+            login_data.update({
+                'txtBrojDosijea': os.getenv("STUDENT_ID"),
+                'txtLozinka': os.getenv("PASSWORD"),
+                'btnPrijava': 'Prijava',
+                '__EVENTTARGET': '',
+                '__EVENTARGUMENT': '',
+                '__VIEWSTATE': login_data.get('__VIEWSTATE', ''),
+                '__VIEWSTATEGENERATOR': login_data.get('__VIEWSTATEGENERATOR', ''),
+                '__EVENTVALIDATION': login_data.get('__EVENTVALIDATION', '')
+            })
+            
+            print("Attempting login...")
+            print(f"Using student ID: {os.getenv('STUDENT_ID')}")
+            print("Password length:", len(os.getenv("PASSWORD", "")))
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': 'https://www.fit.ba',
+                'Referer': self.login_url
+            }
+            
+            response = self.session.post(
+                form_action,
+                data=login_data,
+                headers=headers,
+                allow_redirects=True
+            )
+            response.raise_for_status()
+            
+            if "Obavijesti" in response.text:
+                print("Login successful!")
+                return True
+            else:
+                print("Login failed. Response content:")
+                print(response.text[:500])  # print first 500 chars of response
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Error during login: {e}")
+            return False
+        except Exception as e:
+            print(f"Unexpected error during login: {e}")
+            return False
 
     def get_notifications(self):
         response = self.session.get(self.login_url)
@@ -78,22 +134,81 @@ class FITScraper:
         if not new_notifications:
             return
 
-        msg = MIMEMultipart()
+        msg = MIMEMultipart('alternative')
         msg['From'] = self.sender_email
         msg['To'] = self.recipient_email
         msg['Subject'] = f"New FIT Notifications - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
-        body = "New notifications from FIT:\n\n"
-        for notification in new_notifications:
-            body += f"Title: {notification['title']}\n"
-            body += f"Date: {notification['date']}\n"
-            body += f"Subject: {notification['subject']}\n"
-            body += f"Author: {notification['author']}\n"
-            body += f"Abstract: {notification['abstract']}\n"
-            body += f"Link: {notification['link']}\n"
-            body += "\n" + "-"*50 + "\n\n"
+        html = """
+        <html>
+        <head>
+            <style>
+                body { font-family: Arial, sans-serif; }
+                .notification { 
+                    margin-bottom: 20px; 
+                    padding: 15px;
+                    border-bottom: 1px solid #eee;
+                }
+                .title { 
+                    font-weight: bold;
+                    font-size: 16px;
+                    color: #2c3e50;
+                    margin-bottom: 5px;
+                }
+                .meta { 
+                    color: #7f8c8d;
+                    font-size: 12px;
+                    margin-bottom: 5px;
+                }
+                .abstract {
+                    color: #34495e;
+                    margin-top: 10px;
+                }
+                .link {
+                    color: #3498db;
+                    text-decoration: none;
+                }
+                .link:hover {
+                    text-decoration: underline;
+                }
+            </style>
+        </head>
+        <body>
+            <h2>New notifications from FIT:</h2>
+        """
 
-        msg.attach(MIMEText(body, 'plain'))
+        for notification in new_notifications:
+            html += f"""
+            <div class="notification">
+                <div class="title">{notification['title']}</div>
+                <div class="meta">
+                    Date: {notification['date']}<br>
+                    Subject: {notification['subject']}<br>
+                    Author: {notification['author']}
+                </div>
+                <div class="abstract">{notification['abstract']}</div>
+                <a href="{notification['link']}" class="link">Read more →</a>
+            </div>
+            """
+
+        html += """
+        </body>
+        </html>
+        """
+
+        # plain text version of the email as fallback
+        text = "New notifications from FIT:\n\n"
+        for notification in new_notifications:
+            text += f"Title: {notification['title']}\n"
+            text += f"Date: {notification['date']}\n"
+            text += f"Subject: {notification['subject']}\n"
+            text += f"Author: {notification['author']}\n"
+            text += f"Abstract: {notification['abstract']}\n"
+            text += f"Link: {notification['link']}\n"
+            text += "\n" + "-"*50 + "\n\n"
+
+        msg.attach(MIMEText(text, 'plain'))
+        msg.attach(MIMEText(html, 'html'))
 
         try:
             server = smtplib.SMTP(self.smtp_server, self.smtp_port)
@@ -111,19 +226,32 @@ class FITScraper:
             return
 
         current_notifications = self.get_notifications()
-        new_notifications = [
-            n for n in current_notifications 
-            if n['id'] not in self.seen_notifications
-        ]
+        
+        if self.test_mode:
+            print("Running in test mode - will send all current notifications")
+            new_notifications = current_notifications
+        else:
+            new_notifications = [
+                n for n in current_notifications 
+                if n['id'] not in self.seen_notifications
+            ]
 
         if new_notifications:
             self.send_email(new_notifications)
-            self.seen_notifications.extend([n['id'] for n in new_notifications])
-            self.save_seen_notifications()
-            print(f"Found {len(new_notifications)} new notifications!")
+            if not self.test_mode:
+                self.seen_notifications.extend([n['id'] for n in new_notifications])
+                self.save_seen_notifications()
+            print(f"Found {len(new_notifications)} notifications!")
+            if self.test_mode:
+                print("Test email sent with current notifications!")
         else:
-            print("No new notifications found.")
+            print("No notifications found.")
 
 if __name__ == "__main__":
-    scraper = FITScraper()
+    parser = argparse.ArgumentParser(description='FIT Notification Scraper')
+    parser.add_argument('--test', action='store_true', help='Run in test mode - send all current notifications')
+    parser.add_argument('--debug', action='store_true', help='Show debug information')
+    args = parser.parse_args()
+
+    scraper = FITScraper(test_mode=args.test)
     scraper.run() 
